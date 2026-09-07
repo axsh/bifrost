@@ -99,6 +99,10 @@ const (
 	anthropicInputJSONBufferToolSearch anthropicInputJSONBufferKind = "tool_search"
 )
 
+// Each Anthropic thinking block becomes its own reasoning item, so it holds a single
+// summary block. summary_index is required on every reasoning_summary_* event.
+const anthropicReasoningSummaryIndex = 0
+
 func (state *AnthropicResponsesStreamState) beginInputJSONBuffer(index *int, kind anthropicInputJSONBufferKind) {
 	if index == nil {
 		return
@@ -1839,6 +1843,7 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 						SequenceNumber: sequenceNumber,
 						OutputIndex:    schemas.Ptr(outputIndex),
 						ContentIndex:   chunk.Index,
+						SummaryIndex:   schemas.Ptr(anthropicReasoningSummaryIndex),
 						Delta:          chunk.Delta.Thinking,
 					}
 					if itemID != "" {
@@ -1859,6 +1864,7 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 						SequenceNumber: sequenceNumber,
 						OutputIndex:    schemas.Ptr(outputIndex),
 						ContentIndex:   chunk.Index,
+						SummaryIndex:   schemas.Ptr(anthropicReasoningSummaryIndex),
 						Signature:      chunk.Delta.Signature, // Use signature field instead of delta
 					}
 					if itemID != "" {
@@ -2440,6 +2446,7 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 						SequenceNumber: sequenceNumber + len(responses),
 						OutputIndex:    schemas.Ptr(outputIndex),
 						ContentIndex:   chunk.Index,
+						SummaryIndex:   schemas.Ptr(anthropicReasoningSummaryIndex),
 						Text:           &doneText,
 					}
 					if itemID != "" {
@@ -4225,6 +4232,10 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 	// lookups; the wire Model below stays exactly as the caller sent it.
 	capModel := schemas.ResolveCanonicalModel(ctx, bifrostReq.Model)
 	caps := schemas.ResolveModelCaps(bifrostReq.Provider, capModel)
+	// Fable 5.1+ rejects tool_choice "any"/"tool" outright, so every forced
+	// choice below — the caller's and the synthetic structured-output pin — is
+	// dropped and the model answers under the default "auto".
+	forcedToolChoiceSupported := caps.SupportsForcedToolChoice(schemas.DefaultSupportsForcedToolChoice(capModel))
 
 	anthropicReq := &AnthropicMessageRequest{
 		Model:     bifrostReq.Model,
@@ -4269,7 +4280,7 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 						thinkingEnabled := bifrostReq.Params.Reasoning != nil &&
 							(bifrostReq.Params.Reasoning.MaxTokens != nil ||
 								(bifrostReq.Params.Reasoning.Effort != nil && *bifrostReq.Params.Reasoning.Effort != "none"))
-						if !thinkingEnabled {
+						if !thinkingEnabled && forcedToolChoiceSupported {
 							anthropicReq.ToolChoice = &AnthropicToolChoice{
 								Type: "tool",
 								Name: responseFormatTool.Name,
@@ -4585,8 +4596,10 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 			}
 		}
 
+		forcedToolChoiceRejected := !forcedToolChoiceSupported && bifrostReq.Params.ToolChoice.IsForced()
+
 		// Convert tool choice
-		if bifrostReq.Params.ToolChoice != nil {
+		if bifrostReq.Params.ToolChoice != nil && !forcedToolChoiceRejected {
 			anthropicToolChoice := convertResponsesToolChoiceToAnthropic(bifrostReq.Params.ToolChoice)
 			if anthropicToolChoice != nil {
 				anthropicReq.ToolChoice = anthropicToolChoice
